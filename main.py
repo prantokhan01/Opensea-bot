@@ -1,7 +1,7 @@
 import asyncio
 import time
-from datetime import datetime
-import pytz
+import json
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from web3 import Web3
 from curl_cffi.requests import AsyncSession
@@ -22,8 +22,6 @@ ABI = [
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 user_data = {}
-tz_utc = pytz.timezone('UTC')
-tz_bdt = pytz.timezone('Asia/Dhaka')
 active_tasks = {}
 ADMIN_ID = 1890133465
 
@@ -102,7 +100,8 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = "📋 <b>Currently Tracking:</b>\n\n"
     for slug, info in active_tasks.items():
-        msg += f"🔹 <b>{slug}</b>\n   Phase: {info['phase']}\n   Starts: {info['start_bdt']}\n   Monitoring Since: {info['monitoring_since']}\n\n"
+        start_info = f"   Starts: {info['start_bdt']}\n" if info.get('start_bdt') and info['start_bdt'] != 'Not Set' else "   Starts: Not Set\n"
+        msg += f"🔹 <b>{slug}</b>\n   Phase: {info['phase']}\n{start_info}   Monitoring Since: {info['monitoring_since']}\n\n"
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def fetch_drop_data(slug: str, wallet_address: str):
@@ -144,24 +143,6 @@ async def fetch_drop_data(slug: str, wallet_address: str):
     return None
 
 
-def format_timestamp(ts):
-    if not ts:
-        return "Not Set", "Not Set"
-    try:
-        dt = datetime.fromtimestamp(ts, tz_utc)
-        utc_str = dt.strftime('%d %b %Y, %I:%M %p UTC')
-        bdt_str = dt.astimezone(tz_bdt).strftime('%d %b %Y, %I:%M %p BDT')
-        return utc_str, bdt_str
-    except:
-        return "Unknown", "Unknown"
-
-
-import asyncio
-import json
-from curl_cffi.requests import AsyncSession
-from urllib.parse import urlparse
-import time
-from datetime import datetime, timezone, timedelta
 
 def format_bdt(ts_str):
     if not ts_str:
@@ -389,7 +370,7 @@ async def process_project(update: Update, context: ContextTypes.DEFAULT_TYPE, is
         active_tasks[slug] = {
             "phase": stage_name,
             "start_bdt": start_bdt,
-            "monitoring_since": datetime.now(timezone(timedelta(hours=6))).strftime("%I:%M %p BDT")
+            "monitoring_since": datetime.now(timezone(timedelta(hours=6))).strftime("%b %d at %I:%M %p GMT+6")
         }
 
         task = asyncio.create_task(run_monitor(update, context, contract, slug, stage_name, start_ts, is_eligible))
@@ -427,10 +408,15 @@ async def run_monitor(update, context, contract, slug, phase, start_time, is_el)
     chat_id = update.effective_chat.id
 
     is_tba = False
+    already_live = False
+
     if start_time:
         now = time.time()
         wait_seconds = start_time - now
-        if wait_seconds > 10:
+        if wait_seconds <= 0:
+            # Phase already started before we began tracking
+            already_live = True
+        elif wait_seconds > 10:
             wait_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"⏳ <b>Waiting for phase to start...</b>\nTime left: {int(wait_seconds)} seconds",
@@ -439,10 +425,9 @@ async def run_monitor(update, context, contract, slug, phase, start_time, is_el)
             await asyncio.sleep(wait_seconds - 5)
             await wait_msg.edit_text("🔔 <b>Phase starting in 5 seconds...</b>", parse_mode=ParseMode.HTML)
             await asyncio.sleep(5)
-        elif wait_seconds > 0:
+        else:
             await asyncio.sleep(wait_seconds)
     else:
-        # If start_time is None, phase is Not Scheduled / TBA
         is_tba = True
 
     if is_el is True:
@@ -454,6 +439,8 @@ async def run_monitor(update, context, contract, slug, phase, start_time, is_el)
 
     if is_tba:
         status_text = "⏳ <b>PHASE IS TBA (Not Scheduled)</b>\nMonitoring supply just in case..."
+    elif already_live:
+        status_text = "🟡 <b>PHASE IS ALREADY LIVE!</b>\n⚠️ Mint is currently in progress."
     else:
         status_text = "🔔 <b>PHASE IS LIVE!</b>"
 
