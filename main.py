@@ -102,7 +102,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = "📋 <b>Currently Tracking:</b>\n\n"
     for slug, info in active_tasks.items():
-        msg += f"🔹 <b>{slug}</b>\n   Phase: {info['phase']}\n   Monitoring Since: {info['monitoring_since']}\n\n"
+        msg += f"🔹 <b>{slug}</b>\n   Phase: {info['phase']}\n   Starts: {info['start_bdt']}\n   Monitoring Since: {info['monitoring_since']}\n\n"
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def fetch_drop_data(slug: str, wallet_address: str):
@@ -135,21 +135,11 @@ async def fetch_drop_data(slug: str, wallet_address: str):
         try:
             async with AsyncSession(impersonate="chrome110") as s:
                 response = await s.post(url, headers=headers, json=payload, timeout=15)
-                print(f"[GraphQL] Status: {response.status_code}")
                 if response.status_code == 200:
                     data = response.json()
-                    # Debug auth errors
-                    auth_err = data.get('extensions', {}).get('auth', {}).get('error', {})
-                    if auth_err:
-                        print(f"[AUTH ERROR] {auth_err}")
-                    else:
-                        print("[AUTH] OK - No auth error")
-                    stages = data.get('data', {}).get('dropBySlug', {}).get('stages', [])
-                    for st in stages:
-                        print(f"[DEBUG] Stage: {st.get('stageType')} | isEligible: {st.get('isEligible')} | startTime: {st.get('startTime')}")
                     return data
         except Exception as e:
-            print(f"[GraphQL Error Attempt {attempt+1}] {e}")
+            pass
         await asyncio.sleep(2)
     return None
 
@@ -212,7 +202,7 @@ async def fetch_html_drop_data(slug: str):
                             json_str = clean_html[start_idx:end_idx]
                             return json.loads(json_str)
         except Exception as e:
-            print(f"[HTML Fetch Error Attempt {attempt+1}] {e}")
+            pass
         await asyncio.sleep(2)
     return None
 
@@ -384,19 +374,28 @@ async def process_project(update: Update, context: ContextTypes.DEFAULT_TYPE, is
 
         start_time = target_stage.get('startTime')
         start_bdt = format_bdt(start_time)
+        
+        start_ts = None
+        if start_time:
+            try:
+                st_iso = start_time[:-1] + "+00:00" if start_time.endswith("Z") else start_time
+                start_ts = datetime.fromisoformat(st_iso).timestamp()
+            except:
+                start_ts = None
+                
         is_eligible = target_stage.get('isEligible')
         stage_name = html_stage_map.get(target_stage.get('stageIndex', -1), {}).get('label', target_stage.get('stageType', 'Unknown Phase'))
 
         active_tasks[slug] = {
             "phase": stage_name,
+            "start_bdt": start_bdt,
             "monitoring_since": datetime.now(timezone(timedelta(hours=6))).strftime("%I:%M %p BDT")
         }
 
-        task = asyncio.create_task(run_monitor(update, context, contract, slug, stage_name, start_time, is_eligible))
-        task.add_done_callback(lambda t: print(f"[Monitor Error] {t.exception()}") if t.exception() else None)
+        task = asyncio.create_task(run_monitor(update, context, contract, slug, stage_name, start_ts, is_eligible))
+        task.add_done_callback(lambda t: None)
 
     except Exception as e:
-        print(f"[Track Error] {e}")
         await update.message.reply_text(f"❌ <b>Error:</b> {e}", parse_mode=ParseMode.HTML)
 
 @admin_only
