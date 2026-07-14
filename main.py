@@ -1,8 +1,11 @@
 import asyncio
 import time
+import os
 import json
 from datetime import datetime, timezone, timedelta
+import pytz
 from urllib.parse import urlparse
+from dotenv import load_dotenv
 from web3 import Web3
 from curl_cffi.requests import AsyncSession
 
@@ -11,9 +14,16 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- CONFIGURATION ---
-TOKEN = "8733717658:AAHt7O1KnM5A3l3c3kn_0BlOHgwXwvtQ_7o"
-RPC_URL = "https://morning-small-arrow.ethereum-mainnet.quiknode.pro/97cdbfc4b18057687be47f87a23b7a53c702c8c6/"
-OPENSEA_API_KEY = "6d971257ef384297a611840712d20187"
+load_dotenv()
+
+TOKEN = os.environ.get("BOT_TOKEN")
+RPC_URL = os.environ.get("RPC_URL", "https://morning-small-arrow.ethereum-mainnet.quiknode.pro/97cdbfc4b18057687be47f87a23b7a53c702c8c6/")
+OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY")
+DEFAULT_JWT = os.environ.get("DEFAULT_JWT")
+
+if not TOKEN or not DEFAULT_JWT:
+    print("❌ ERROR: BOT_TOKEN or DEFAULT_JWT is missing in environment variables!")
+    exit(1)
 
 ABI = [
     {"inputs": [], "name": "totalSupply", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
@@ -22,6 +32,8 @@ ABI = [
 
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 user_data = {}
+tz_utc = pytz.timezone('UTC')
+tz_bdt = pytz.timezone('Asia/Dhaka')
 active_tasks = {}
 ADMIN_ID = 1890133465
 
@@ -32,11 +44,6 @@ def admin_only(func):
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
-
-# Only the JWT part is needed - Cloudflare cookies (__cf_bm etc.) expire in 30 mins
-# Paste ONLY the eyJraWQ...signature part here (before the first semicolon)
-DEFAULT_JWT = "eyJraWQiOiIzOGQwMGE2ZmJhM2E5M2RmNDJkNThhMWY0OTUwZmJhNTAxMzgwMjE4NjFlOGJiNjU3ODM1NWUzYjQzMzE5NmY1IiwidHlwIjoiSldUIiwiYWxnIjoiRVMyNTYifQ.eyJpc3MiOiJvcGVuc2VhLmlvIiwic3ViIjoiY2U4ZTZiNTEtOWNhNy00YjM5LWFmYmQtNTY5YWY5MmFlYTA0Iiwid2FsbGV0Ijoie1wiYWRkcmVzc1wiOlwiMHg0YzA2ZDNiZjNjYTJhZWE2NGJmNWJiOWE4MDcxMDc4YzY5NjViZjhjXCIsXCJjaGFpbkFyY2hpdGVjdHVyZVwiOlwiMVwiLFwiY2hhaW5JZFwiOlwiMVwifSIsInN0YXR1cyI6ImFjdGl2ZSIsImVtcGxveWVlIjpmYWxzZSwiZW1iZWRkZWQiOmZhbHNlLCJkZXZlbG9wZXIiOnRydWUsImV4cCI6MTc4NDI1MTg1NiwibmJmIjoxNzgzOTQ5Mzk2LCJpYXQiOjE3ODM5NDkzOTYsImp0aSI6IjRiNzJhMWE4YjZmODRiOTk5ZjQwYjg5Zjk2MDI3NDc4In0.M4XCIZwco0tYj-QbkpKW3FY7NeTfcTQwgSroUHr7pVUOVuFToezC702ukwWF0xX1VDG6it1vxWVU5QJ-2sJ-oA"
-
 
 @admin_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,6 +149,17 @@ async def fetch_drop_data(slug: str, wallet_address: str):
         await asyncio.sleep(2)
     return None
 
+
+def format_timestamp(ts):
+    if not ts:
+        return "Not Set", "Not Set"
+    try:
+        dt = datetime.fromtimestamp(ts, tz_utc)
+        utc_str = dt.strftime('%d %b %Y, %I:%M %p UTC')
+        bdt_str = dt.astimezone(tz_bdt).strftime('%d %b %Y, %I:%M %p BDT')
+        return utc_str, bdt_str
+    except:
+        return "Unknown", "Unknown"
 
 
 def format_bdt(ts_str):
@@ -353,27 +371,46 @@ async def process_project(update: Update, context: ContextTypes.DEFAULT_TYPE, is
             await context.bot.send_message(update.effective_chat.id, "⚠️ <b>Contract Address not found. Live minting won't be tracked.</b>", parse_mode=ParseMode.HTML)
             return
 
-        start_time = target_stage.get('startTime')
-        start_bdt = format_bdt(start_time)
-        
-        start_ts = None
-        if start_time:
-            try:
-                st_iso = start_time[:-1] + "+00:00" if start_time.endswith("Z") else start_time
-                start_ts = datetime.fromisoformat(st_iso).timestamp()
-            except:
-                start_ts = None
-                
-        is_eligible = target_stage.get('isEligible')
-        stage_name = html_stage_map.get(target_stage.get('stageIndex', -1), {}).get('label', target_stage.get('stageType', 'Unknown Phase'))
+        upcoming_phases = []
+        for g_stage in gql_stages:
+            idx = g_stage.get('stageIndex')
+            h_stage = html_stage_map.get(idx, {})
+            start_time = h_stage.get('startTime') or g_stage.get('startTime')
+            end_time = h_stage.get('endTime') or g_stage.get('endTime')
+            
+            start_ts = None
+            if start_time:
+                try:
+                    st_iso = start_time[:-1] + "+00:00" if start_time.endswith("Z") else start_time
+                    start_ts = datetime.fromisoformat(st_iso).timestamp()
+                except:
+                    pass
+            
+            # Skip if already ended
+            if end_time:
+                try:
+                    et_iso = end_time[:-1] + "+00:00" if end_time.endswith("Z") else end_time
+                    end_ts = datetime.fromisoformat(et_iso).timestamp()
+                    if end_ts < time.time():
+                        continue
+                except:
+                    pass
+            
+            stage_name = h_stage.get('label') or g_stage.get('stageType', 'Unknown Phase')
+            is_eligible = g_stage.get('isEligible')
+            
+            upcoming_phases.append({
+                "stage_name": stage_name,
+                "start_time": start_time,
+                "start_ts": start_ts,
+                "is_eligible": is_eligible
+            })
+            
+        if not upcoming_phases:
+            await context.bot.send_message(update.effective_chat.id, "⚠️ <b>No upcoming phases found to track.</b>", parse_mode=ParseMode.HTML)
+            return
 
-        active_tasks[slug] = {
-            "phase": stage_name,
-            "start_bdt": start_bdt,
-            "monitoring_since": datetime.now(timezone(timedelta(hours=6))).strftime("%b %d at %I:%M %p GMT+6")
-        }
-
-        task = asyncio.create_task(run_monitor(update, context, contract, slug, stage_name, start_ts, is_eligible))
+        task = asyncio.create_task(run_monitor(update, context, contract, slug, upcoming_phases))
         task.add_done_callback(lambda t: None)
 
     except Exception as e:
@@ -404,94 +441,126 @@ async def remove_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_tasks.clear()
     await update.message.reply_text("✅ <b>Removed ALL tracked projects.</b>", parse_mode=ParseMode.HTML)
 
-async def run_monitor(update, context, contract, slug, phase, start_time, is_el):
+async def run_monitor(update, context, contract, slug, upcoming_phases):
     chat_id = update.effective_chat.id
 
-    is_tba = False
-    already_live = False
+    first_st = upcoming_phases[0]
+    active_tasks[slug] = {
+        "phase": first_st["stage_name"],
+        "start_bdt": format_bdt(first_st["start_time"]),
+        "monitoring_since": datetime.now(timezone(timedelta(hours=6))).strftime("%b %d at %I:%M %p GMT+6")
+    }
 
-    if start_time:
-        now = time.time()
-        wait_seconds = start_time - now
-        if wait_seconds <= 0:
-            # Phase already started before we began tracking
-            already_live = True
-        elif wait_seconds > 10:
-            wait_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⏳ <b>Waiting for phase to start...</b>\nTime left: {int(wait_seconds)} seconds",
-                parse_mode=ParseMode.HTML
-            )
-            await asyncio.sleep(wait_seconds - 5)
-            await wait_msg.edit_text("🔔 <b>Phase starting in 5 seconds...</b>", parse_mode=ParseMode.HTML)
-            await asyncio.sleep(5)
-        else:
-            await asyncio.sleep(wait_seconds)
-    else:
-        is_tba = True
+    async def poll_supply():
+        if contract is None:
+            while slug in active_tasks:
+                await asyncio.sleep(60)
+            return
 
-    if is_el is True:
-        el_text = "✅ YOU ARE ELIGIBLE!"
-    elif is_el is False:
-        el_text = "❌ You are NOT ELIGIBLE."
-    else:
-        el_text = "⚠️ Eligibility Unknown."
-
-    if is_tba:
-        status_text = "⏳ <b>PHASE IS TBA (Not Scheduled)</b>\nMonitoring supply just in case..."
-    elif already_live:
-        status_text = "🟡 <b>PHASE IS ALREADY LIVE!</b>\n⚠️ Mint is currently in progress."
-    else:
-        status_text = "🔔 <b>PHASE IS LIVE!</b>"
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"""{status_text}
-
-🖼 Project: <b>{slug}</b>
-🔹 Phase: <b>{phase}</b>
-{el_text}
-
-Go to OpenSea (https://opensea.io/collection/{slug}/drop)""",
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True
-    )
-
-    if contract is None:
-        # Keep it in active_tasks so it shows in /list, but we can't poll
-        while slug in active_tasks:
-            await asyncio.sleep(60)
-        return
-
-    try:
-        max_s = contract.functions.maxSupply().call()
-    except:
-        max_s = None
-
-    if not max_s:
-        # Cannot detect sold out, keep alive in list
-        while slug in active_tasks:
-            await asyncio.sleep(60)
-        return
-
-    # Silently poll for sold out every 10 seconds
-    while True:
-        if slug not in active_tasks:
-            break
         try:
-            curr = contract.functions.totalSupply().call()
-            if curr >= max_s:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🔴 <b>SOLD OUT!</b> {slug} has minted out.",
-                    parse_mode=ParseMode.HTML
-                )
-                break
-            await asyncio.sleep(10)
-        except Exception as e:
+            max_s = contract.functions.maxSupply().call()
+        except:
+            max_s = None
+
+        if not max_s:
+            while slug in active_tasks:
+                await asyncio.sleep(60)
+            return
+
+        while slug in active_tasks:
+            try:
+                curr = contract.functions.totalSupply().call()
+                if curr >= max_s:
+                    if slug in active_tasks:
+                        active_tasks.pop(slug, None)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🔴 <b>SOLD OUT!</b> {slug} has minted out.",
+                        parse_mode=ParseMode.HTML
+                    )
+                    break
+            except:
+                pass
             await asyncio.sleep(10)
 
-    active_tasks.pop(slug, None)
+    async def poll_phases():
+        for i, st in enumerate(upcoming_phases):
+            if slug not in active_tasks:
+                break
+
+            phase_name = st["stage_name"]
+            start_ts = st["start_ts"]
+            is_el = st["is_eligible"]
+            
+            # Update active_tasks for the current phase we're waiting for
+            if slug in active_tasks:
+                active_tasks[slug]["phase"] = phase_name
+                active_tasks[slug]["start_bdt"] = format_bdt(st["start_time"])
+
+            if is_el is True:
+                el_text = "✅ YOU ARE ELIGIBLE!"
+            elif is_el is False:
+                el_text = "❌ You are NOT ELIGIBLE."
+            else:
+                el_text = "⚠️ Eligibility Unknown."
+
+            if start_ts:
+                now = time.time()
+                wait_seconds = start_ts - now
+
+                if wait_seconds <= 0:
+                    # Only send "ALREADY LIVE" for the very first phase we process if it's past due
+                    if i == 0:
+                        if slug in active_tasks:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"🟡 <b>PHASE IS ALREADY LIVE!</b>\n⚠️ Mint is currently in progress.\n\n🖼 Project: <b>{slug}</b>\n🔹 Phase: <b>{phase_name}</b>\n{el_text}\n\nGo to OpenSea (https://opensea.io/collection/{slug}/drop)",
+                                parse_mode=ParseMode.HTML, disable_web_page_preview=True
+                            )
+                else:
+                    if wait_seconds > 10:
+                        wait_msg = await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⏳ <b>Waiting for phase to start...</b>\nTime left: {int(wait_seconds)} seconds",
+                            parse_mode=ParseMode.HTML
+                        )
+                        chunk = 5
+                        slept = 0
+                        target_sleep = wait_seconds - 5
+                        while slept < target_sleep and slug in active_tasks:
+                            sleep_for = min(chunk, target_sleep - slept)
+                            await asyncio.sleep(sleep_for)
+                            slept += sleep_for
+
+                        if slug in active_tasks:
+                            await wait_msg.edit_text("🔔 <b>Phase starting in 5 seconds...</b>", parse_mode=ParseMode.HTML)
+                            # Wait final 5 seconds checking if active
+                            for _ in range(5):
+                                if slug not in active_tasks:
+                                    break
+                                await asyncio.sleep(1)
+                    else:
+                        await asyncio.sleep(wait_seconds)
+
+                    if slug in active_tasks:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🔔 <b>PHASE IS LIVE!</b>\n\n🖼 Project: <b>{slug}</b>\n🔹 Phase: <b>{phase_name}</b>\n{el_text}\n\nGo to OpenSea (https://opensea.io/collection/{slug}/drop)",
+                            parse_mode=ParseMode.HTML, disable_web_page_preview=True
+                        )
+            else:
+                if slug in active_tasks:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⏳ <b>PHASE IS TBA (Not Scheduled)</b>\nMonitoring supply just in case...\n\n🖼 Project: <b>{slug}</b>\n🔹 Phase: <b>{phase_name}</b>\n{el_text}\n\nGo to OpenSea (https://opensea.io/collection/{slug}/drop)",
+                        parse_mode=ParseMode.HTML, disable_web_page_preview=True
+                    )
+                    
+        # After all phases are done, if we can't monitor supply, we can remove the task
+        if contract is None:
+            active_tasks.pop(slug, None)
+
+    await asyncio.gather(poll_supply(), poll_phases())
 
 if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
